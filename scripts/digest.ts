@@ -348,10 +348,35 @@ async function callLLM(prompt: string, apiKey: string): Promise<string> {
 
 function parseJsonResponse<T>(text: string): T {
   let jsonText = text.trim();
+  
+  // Strip markdown code blocks
   if (jsonText.startsWith('```')) {
     jsonText = jsonText.replace(/^```(?:json)?\n?/, '').replace(/\n?```$/, '');
   }
-  return JSON.parse(jsonText) as T;
+  
+  // Try to extract JSON object from text
+  const jsonMatch = jsonText.match(/\{[\s\S]*\}/);
+  if (jsonMatch) {
+    jsonText = jsonMatch[0];
+  }
+  
+  // Try to fix common JSON issues
+  // Fix trailing commas before } or ]
+  jsonText = jsonText.replace(/,(\s*[}\]])/g, '$1');
+  // Fix unescaped newlines in strings
+  jsonText = jsonText.replace(/\n(?=[^"]*"[^"]*$)/g, '\\n');
+  
+  try {
+    return JSON.parse(jsonText) as T;
+  } catch (e) {
+    // Last resort: try to find results array
+    const resultsMatch = jsonText.match(/"results"\s*:\s*\[[\s\S]*\]/);
+    if (resultsMatch) {
+      const fixedJson = `{${resultsMatch[0]}}`;
+      return JSON.parse(fixedJson) as T;
+    }
+    throw e;
+  }
 }
 
 // ============================================================================
