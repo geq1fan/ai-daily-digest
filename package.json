@@ -1,0 +1,13 @@
+{
+  "name": "ai-daily-digest",
+  "version": "1.0.0",
+  "description": "AI-powered RSS digest from 90 top tech blogs",
+  "main": "scripts/digest.js",
+  "type": "module",
+  "scripts": {
+    "build": "tsc scripts/digest.ts --outDir dist --module ESNext --target ES2022 --moduleResolution node --esModuleInterop",
+    "start": "node scripts/digest.js"
+  },
+  "keywords": ["rss", "digest", "ai", "news"],
+  "license": "MIT"
+}

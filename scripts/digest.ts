@@ -6,11 +6,14 @@ import process from 'node:process';
 // Constants
 // ============================================================================
 
-const GEMINI_API_URL = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent';
+// OpenAI-compatible API configuration
+const LLM_API_URL = process.env.LLM_API_URL || 'https://api.moonshot.cn/v1/chat/completions';
+const LLM_MODEL = process.env.LLM_MODEL || 'moonshot-v1-8k';
+
 const FEED_FETCH_TIMEOUT_MS = 15_000;
 const FEED_CONCURRENCY = 10;
-const GEMINI_BATCH_SIZE = 10;
-const MAX_CONCURRENT_GEMINI = 2;
+const LLM_BATCH_SIZE = 10;
+const MAX_CONCURRENT_LLM = 2;
 
 // 90 RSS feeds from Hacker News Popularity Contest 2025 (curated by Karpathy)
 const RSS_FEEDS: Array<{ name: string; xmlUrl: string; htmlUrl: string }> = [
@@ -146,7 +149,7 @@ interface ScoredArticle extends Article {
   reason: string;
 }
 
-interface GeminiScoringResult {
+interface LLMScoringResult {
   results: Array<{
     index: number;
     relevance: number;
@@ -157,7 +160,7 @@ interface GeminiScoringResult {
   }>;
 }
 
-interface GeminiSummaryResult {
+interface LLMSummaryResult {
   results: Array<{
     index: number;
     titleZh: string;
@@ -167,7 +170,7 @@ interface GeminiSummaryResult {
 }
 
 // ============================================================================
-// RSS/Atom Parsing (using Bun's built-in HTMLRewriter or manual XML parsing)
+// RSS/Atom Parsing
 // ============================================================================
 
 function stripHtml(html: string): string {
@@ -189,10 +192,9 @@ function extractCDATA(text: string): string {
 }
 
 function getTagContent(xml: string, tagName: string): string {
-  // Handle namespaced and non-namespaced tags
   const patterns = [
     new RegExp(`<${tagName}[^>]*>([\\s\\S]*?)</${tagName}>`, 'i'),
-    new RegExp(`<${tagName}[^>]*/>`, 'i'), // self-closing
+    new RegExp(`<${tagName}[^>]*/>`, 'i'),
   ];
   
   for (const pattern of patterns) {
@@ -212,75 +214,39 @@ function getAttrValue(xml: string, tagName: string, attrName: string): string {
 
 function parseDate(dateStr: string): Date | null {
   if (!dateStr) return null;
-  
   const d = new Date(dateStr);
   if (!isNaN(d.getTime())) return d;
-  
-  // Try common RSS date formats
-  // RFC 822: "Mon, 01 Jan 2024 00:00:00 GMT"
-  const rfc822 = dateStr.match(/(\d{1,2})\s+(\w{3})\s+(\d{4})\s+(\d{2}):(\d{2}):(\d{2})/);
-  if (rfc822) {
-    const parsed = new Date(dateStr);
-    if (!isNaN(parsed.getTime())) return parsed;
-  }
-  
   return null;
 }
 
 function parseRSSItems(xml: string): Array<{ title: string; link: string; pubDate: string; description: string }> {
   const items: Array<{ title: string; link: string; pubDate: string; description: string }> = [];
-  
-  // Detect format: Atom vs RSS
   const isAtom = xml.includes('<feed') && xml.includes('xmlns="http://www.w3.org/2005/Atom"') || xml.includes('<feed ');
   
   if (isAtom) {
-    // Atom format: <entry>
     const entryPattern = /<entry[\s>]([\s\S]*?)<\/entry>/gi;
     let entryMatch;
     while ((entryMatch = entryPattern.exec(xml)) !== null) {
       const entryXml = entryMatch[1];
       const title = stripHtml(getTagContent(entryXml, 'title'));
-      
-      // Atom link: <link href="..." rel="alternate"/>
       let link = getAttrValue(entryXml, 'link[^>]*rel="alternate"', 'href');
-      if (!link) {
-        link = getAttrValue(entryXml, 'link', 'href');
-      }
-      
-      const pubDate = getTagContent(entryXml, 'published') 
-        || getTagContent(entryXml, 'updated');
-      
-      const description = stripHtml(
-        getTagContent(entryXml, 'summary') 
-        || getTagContent(entryXml, 'content')
-      );
-      
-      if (title || link) {
-        items.push({ title, link, pubDate, description: description.slice(0, 500) });
-      }
+      if (!link) link = getAttrValue(entryXml, 'link', 'href');
+      const pubDate = getTagContent(entryXml, 'published') || getTagContent(entryXml, 'updated');
+      const description = stripHtml(getTagContent(entryXml, 'summary') || getTagContent(entryXml, 'content'));
+      if (title || link) items.push({ title, link, pubDate, description: description.slice(0, 500) });
     }
   } else {
-    // RSS format: <item>
     const itemPattern = /<item[\s>]([\s\S]*?)<\/item>/gi;
     let itemMatch;
     while ((itemMatch = itemPattern.exec(xml)) !== null) {
       const itemXml = itemMatch[1];
       const title = stripHtml(getTagContent(itemXml, 'title'));
       const link = getTagContent(itemXml, 'link') || getTagContent(itemXml, 'guid');
-      const pubDate = getTagContent(itemXml, 'pubDate') 
-        || getTagContent(itemXml, 'dc:date')
-        || getTagContent(itemXml, 'date');
-      const description = stripHtml(
-        getTagContent(itemXml, 'description') 
-        || getTagContent(itemXml, 'content:encoded')
-      );
-      
-      if (title || link) {
-        items.push({ title, link, pubDate, description: description.slice(0, 500) });
-      }
+      const pubDate = getTagContent(itemXml, 'pubDate') || getTagContent(itemXml, 'dc:date') || getTagContent(itemXml, 'date');
+      const description = stripHtml(getTagContent(itemXml, 'description') || getTagContent(itemXml, 'content:encoded'));
+      if (title || link) items.push({ title, link, pubDate, description: description.slice(0, 500) });
     }
   }
-  
   return items;
 }
 
@@ -302,10 +268,7 @@ async function fetchFeed(feed: { name: string; xmlUrl: string; htmlUrl: string }
     });
     
     clearTimeout(timeout);
-    
-    if (!response.ok) {
-      throw new Error(`HTTP ${response.status}`);
-    }
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
     
     const xml = await response.text();
     const items = parseRSSItems(xml);
@@ -320,11 +283,8 @@ async function fetchFeed(feed: { name: string; xmlUrl: string; htmlUrl: string }
     }));
   } catch (error) {
     const msg = error instanceof Error ? error.message : String(error);
-    // Only log non-abort errors to reduce noise
     if (!msg.includes('abort')) {
       console.warn(`[digest] ✗ ${feed.name}: ${msg}`);
-    } else {
-      console.warn(`[digest] ✗ ${feed.name}: timeout`);
     }
     return [];
   }
@@ -332,8 +292,7 @@ async function fetchFeed(feed: { name: string; xmlUrl: string; htmlUrl: string }
 
 async function fetchAllFeeds(feeds: typeof RSS_FEEDS): Promise<Article[]> {
   const allArticles: Article[] = [];
-  let successCount = 0;
-  let failCount = 0;
+  let successCount = 0, failCount = 0;
   
   for (let i = 0; i < feeds.length; i += FEED_CONCURRENCY) {
     const batch = feeds.slice(i, i + FEED_CONCURRENCY);
@@ -347,9 +306,7 @@ async function fetchAllFeeds(feeds: typeof RSS_FEEDS): Promise<Article[]> {
         failCount++;
       }
     }
-    
-    const progress = Math.min(i + FEED_CONCURRENCY, feeds.length);
-    console.log(`[digest] Progress: ${progress}/${feeds.length} feeds processed (${successCount} ok, ${failCount} failed)`);
+    console.log(`[digest] Progress: ${Math.min(i + FEED_CONCURRENCY, feeds.length)}/${feeds.length} feeds`);
   }
   
   console.log(`[digest] Fetched ${allArticles.length} articles from ${successCount} feeds (${failCount} failed)`);
@@ -357,40 +314,40 @@ async function fetchAllFeeds(feeds: typeof RSS_FEEDS): Promise<Article[]> {
 }
 
 // ============================================================================
-// Gemini API
+// OpenAI-compatible API
 // ============================================================================
 
-async function callGemini(prompt: string, apiKey: string): Promise<string> {
-  const response = await fetch(`${GEMINI_API_URL}?key=${apiKey}`, {
+async function callLLM(prompt: string, apiKey: string): Promise<string> {
+  const response = await fetch(LLM_API_URL, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${apiKey}`,
+    },
     body: JSON.stringify({
-      contents: [{ parts: [{ text: prompt }] }],
-      generationConfig: {
-        temperature: 0.3,
-        topP: 0.8,
-        topK: 40,
-      },
+      model: LLM_MODEL,
+      messages: [{ role: 'user', content: prompt }],
+      temperature: 0.3,
+      max_tokens: 4096,
     }),
   });
   
   if (!response.ok) {
     const errorText = await response.text().catch(() => 'Unknown error');
-    throw new Error(`Gemini API error (${response.status}): ${errorText}`);
+    throw new Error(`LLM API error (${response.status}): ${errorText}`);
   }
   
   const data = await response.json() as {
-    candidates?: Array<{
-      content?: { parts?: Array<{ text?: string }> };
+    choices?: Array<{
+      message?: { content?: string };
     }>;
   };
   
-  return data.candidates?.[0]?.content?.parts?.[0]?.text || '';
+  return data.choices?.[0]?.message?.content || '';
 }
 
 function parseJsonResponse<T>(text: string): T {
   let jsonText = text.trim();
-  // Strip markdown code blocks if present
   if (jsonText.startsWith('```')) {
     jsonText = jsonText.replace(/^```(?:json)?\n?/, '').replace(/\n?```$/, '');
   }
@@ -467,28 +424,25 @@ async function scoreArticlesWithAI(
   const allScores = new Map<number, { relevance: number; quality: number; timeliness: number; category: CategoryId; keywords: string[] }>();
   
   const indexed = articles.map((article, index) => ({
-    index,
-    title: article.title,
-    description: article.description,
-    sourceName: article.sourceName,
+    index, title: article.title, description: article.description, sourceName: article.sourceName,
   }));
   
   const batches: typeof indexed[] = [];
-  for (let i = 0; i < indexed.length; i += GEMINI_BATCH_SIZE) {
-    batches.push(indexed.slice(i, i + GEMINI_BATCH_SIZE));
+  for (let i = 0; i < indexed.length; i += LLM_BATCH_SIZE) {
+    batches.push(indexed.slice(i, i + LLM_BATCH_SIZE));
   }
   
   console.log(`[digest] AI scoring: ${articles.length} articles in ${batches.length} batches`);
   
   const validCategories = new Set<string>(['ai-ml', 'security', 'engineering', 'tools', 'opinion', 'other']);
   
-  for (let i = 0; i < batches.length; i += MAX_CONCURRENT_GEMINI) {
-    const batchGroup = batches.slice(i, i + MAX_CONCURRENT_GEMINI);
+  for (let i = 0; i < batches.length; i += MAX_CONCURRENT_LLM) {
+    const batchGroup = batches.slice(i, i + MAX_CONCURRENT_LLM);
     const promises = batchGroup.map(async (batch) => {
       try {
         const prompt = buildScoringPrompt(batch);
-        const responseText = await callGemini(prompt, apiKey);
-        const parsed = parseJsonResponse<GeminiScoringResult>(responseText);
+        const responseText = await callLLM(prompt, apiKey);
+        const parsed = parseJsonResponse<LLMScoringResult>(responseText);
         
         if (parsed.results && Array.isArray(parsed.results)) {
           for (const result of parsed.results) {
@@ -512,7 +466,7 @@ async function scoreArticlesWithAI(
     });
     
     await Promise.all(promises);
-    console.log(`[digest] Scoring progress: ${Math.min(i + MAX_CONCURRENT_GEMINI, batches.length)}/${batches.length} batches`);
+    console.log(`[digest] Scoring progress: ${Math.min(i + MAX_CONCURRENT_LLM, batches.length)}/${batches.length} batches`);
   }
   
   return allScores;
@@ -577,27 +531,23 @@ async function summarizeArticles(
   const summaries = new Map<number, { titleZh: string; summary: string; reason: string }>();
   
   const indexed = articles.map(a => ({
-    index: a.index,
-    title: a.title,
-    description: a.description,
-    sourceName: a.sourceName,
-    link: a.link,
+    index: a.index, title: a.title, description: a.description, sourceName: a.sourceName, link: a.link,
   }));
   
   const batches: typeof indexed[] = [];
-  for (let i = 0; i < indexed.length; i += GEMINI_BATCH_SIZE) {
-    batches.push(indexed.slice(i, i + GEMINI_BATCH_SIZE));
+  for (let i = 0; i < indexed.length; i += LLM_BATCH_SIZE) {
+    batches.push(indexed.slice(i, i + LLM_BATCH_SIZE));
   }
   
   console.log(`[digest] Generating summaries for ${articles.length} articles in ${batches.length} batches`);
   
-  for (let i = 0; i < batches.length; i += MAX_CONCURRENT_GEMINI) {
-    const batchGroup = batches.slice(i, i + MAX_CONCURRENT_GEMINI);
+  for (let i = 0; i < batches.length; i += MAX_CONCURRENT_LLM) {
+    const batchGroup = batches.slice(i, i + MAX_CONCURRENT_LLM);
     const promises = batchGroup.map(async (batch) => {
       try {
         const prompt = buildSummaryPrompt(batch, lang);
-        const responseText = await callGemini(prompt, apiKey);
-        const parsed = parseJsonResponse<GeminiSummaryResult>(responseText);
+        const responseText = await callLLM(prompt, apiKey);
+        const parsed = parseJsonResponse<LLMSummaryResult>(responseText);
         
         if (parsed.results && Array.isArray(parsed.results)) {
           for (const result of parsed.results) {
@@ -617,7 +567,7 @@ async function summarizeArticles(
     });
     
     await Promise.all(promises);
-    console.log(`[digest] Summary progress: ${Math.min(i + MAX_CONCURRENT_GEMINI, batches.length)}/${batches.length} batches`);
+    console.log(`[digest] Summary progress: ${Math.min(i + MAX_CONCURRENT_LLM, batches.length)}/${batches.length} batches`);
   }
   
   return summaries;
@@ -651,7 +601,7 @@ ${articleList}
 直接返回纯文本总结，不要 JSON，不要 markdown 格式。`;
 
   try {
-    const text = await callGemini(prompt, apiKey);
+    const text = await callLLM(prompt, apiKey);
     return text.trim();
   } catch (error) {
     console.warn(`[digest] Highlights generation failed: ${error instanceof Error ? error.message : String(error)}`);
@@ -660,7 +610,7 @@ ${articleList}
 }
 
 // ============================================================================
-// Visualization Helpers
+// Report Generation
 // ============================================================================
 
 function humanizeTime(pubDate: Date): string {
@@ -669,117 +619,11 @@ function humanizeTime(pubDate: Date): string {
   const diffHours = Math.floor(diffMs / 3_600_000);
   const diffDays = Math.floor(diffMs / 86_400_000);
 
-  if (diffMins < 60) return `${diffMins} 分钟前`;
-  if (diffHours < 24) return `${diffHours} 小时前`;
-  if (diffDays < 7) return `${diffDays} 天前`;
+  if (diffMins < 60) return `${diffMins}分钟前`;
+  if (diffHours < 24) return `${diffHours}小时前`;
+  if (diffDays < 7) return `${diffDays}天前`;
   return pubDate.toISOString().slice(0, 10);
 }
-
-function generateKeywordBarChart(articles: ScoredArticle[]): string {
-  const kwCount = new Map<string, number>();
-  for (const a of articles) {
-    for (const kw of a.keywords) {
-      const normalized = kw.toLowerCase();
-      kwCount.set(normalized, (kwCount.get(normalized) || 0) + 1);
-    }
-  }
-
-  const sorted = Array.from(kwCount.entries())
-    .sort((a, b) => b[1] - a[1])
-    .slice(0, 12);
-
-  if (sorted.length === 0) return '';
-
-  const labels = sorted.map(([k]) => `"${k}"`).join(', ');
-  const values = sorted.map(([, v]) => v).join(', ');
-  const maxVal = sorted[0][1];
-
-  let chart = '```mermaid\n';
-  chart += `xychart-beta horizontal\n`;
-  chart += `    title "高频关键词"\n`;
-  chart += `    x-axis [${labels}]\n`;
-  chart += `    y-axis "出现次数" 0 --> ${maxVal + 2}\n`;
-  chart += `    bar [${values}]\n`;
-  chart += '```\n';
-
-  return chart;
-}
-
-function generateCategoryPieChart(articles: ScoredArticle[]): string {
-  const catCount = new Map<CategoryId, number>();
-  for (const a of articles) {
-    catCount.set(a.category, (catCount.get(a.category) || 0) + 1);
-  }
-
-  if (catCount.size === 0) return '';
-
-  const sorted = Array.from(catCount.entries()).sort((a, b) => b[1] - a[1]);
-
-  let chart = '```mermaid\n';
-  chart += `pie showData\n`;
-  chart += `    title "文章分类分布"\n`;
-  for (const [cat, count] of sorted) {
-    const meta = CATEGORY_META[cat];
-    chart += `    "${meta.emoji} ${meta.label}" : ${count}\n`;
-  }
-  chart += '```\n';
-
-  return chart;
-}
-
-function generateAsciiBarChart(articles: ScoredArticle[]): string {
-  const kwCount = new Map<string, number>();
-  for (const a of articles) {
-    for (const kw of a.keywords) {
-      const normalized = kw.toLowerCase();
-      kwCount.set(normalized, (kwCount.get(normalized) || 0) + 1);
-    }
-  }
-
-  const sorted = Array.from(kwCount.entries())
-    .sort((a, b) => b[1] - a[1])
-    .slice(0, 10);
-
-  if (sorted.length === 0) return '';
-
-  const maxVal = sorted[0][1];
-  const maxBarWidth = 20;
-  const maxLabelLen = Math.max(...sorted.map(([k]) => k.length));
-
-  let chart = '```\n';
-  for (const [label, value] of sorted) {
-    const barLen = Math.max(1, Math.round((value / maxVal) * maxBarWidth));
-    const bar = '█'.repeat(barLen) + '░'.repeat(maxBarWidth - barLen);
-    chart += `${label.padEnd(maxLabelLen)} │ ${bar} ${value}\n`;
-  }
-  chart += '```\n';
-
-  return chart;
-}
-
-function generateTagCloud(articles: ScoredArticle[]): string {
-  const kwCount = new Map<string, number>();
-  for (const a of articles) {
-    for (const kw of a.keywords) {
-      const normalized = kw.toLowerCase();
-      kwCount.set(normalized, (kwCount.get(normalized) || 0) + 1);
-    }
-  }
-
-  const sorted = Array.from(kwCount.entries())
-    .sort((a, b) => b[1] - a[1])
-    .slice(0, 20);
-
-  if (sorted.length === 0) return '';
-
-  return sorted
-    .map(([word, count], i) => i < 3 ? `**${word}**(${count})` : `${word}(${count})`)
-    .join(' · ');
-}
-
-// ============================================================================
-// Report Generation
-// ============================================================================
 
 function generateDigestReport(articles: ScoredArticle[], highlights: string, stats: {
   totalFeeds: number;
@@ -792,67 +636,49 @@ function generateDigestReport(articles: ScoredArticle[], highlights: string, sta
   const now = new Date();
   const dateStr = now.toISOString().split('T')[0];
   
-  let report = `# 📰 AI 博客每日精选 — ${dateStr}\n\n`;
-  report += `> 来自 Karpathy 推荐的 ${stats.totalFeeds} 个顶级技术博客，AI 精选 Top ${articles.length}\n\n`;
+  let report = `📰 AI 博客每日精选 — ${dateStr}\n\n`;
+  report += `来自 Karpathy 推荐的 ${stats.totalFeeds} 个顶级技术博客，AI 精选 Top ${articles.length}\n\n`;
 
-  // ── Today's Highlights ──
   if (highlights) {
-    report += `## 📝 今日看点\n\n`;
-    report += `${highlights}\n\n`;
-    report += `---\n\n`;
+    report += `📝 今日看点\n\n${highlights}\n\n`;
+    report += `─────────────\n\n`;
   }
 
-  // ── Top 3 Deep Showcase ──
   if (articles.length >= 3) {
-    report += `## 🏆 今日必读\n\n`;
+    report += `🏆 今日必读\n\n`;
     for (let i = 0; i < Math.min(3, articles.length); i++) {
       const a = articles[i];
       const medal = ['🥇', '🥈', '🥉'][i];
       const catMeta = CATEGORY_META[a.category];
+      const scoreTotal = a.scoreBreakdown.relevance + a.scoreBreakdown.quality + a.scoreBreakdown.timeliness;
       
-      report += `${medal} **${a.titleZh || a.title}**\n\n`;
-      report += `[${a.title}](${a.link}) — ${a.sourceName} · ${humanizeTime(a.pubDate)} · ${catMeta.emoji} ${catMeta.label}\n\n`;
+      report += `${medal} ${a.titleZh || a.title}\n`;
+      report += `${a.link}\n`;
+      report += `${a.sourceName} · ${humanizeTime(a.pubDate)} · ${catMeta.emoji} ${catMeta.label} · ⭐${scoreTotal}/30\n\n`;
       report += `> ${a.summary}\n\n`;
-      if (a.reason) {
-        report += `💡 **为什么值得读**: ${a.reason}\n\n`;
-      }
-      if (a.keywords.length > 0) {
-        report += `🏷️ ${a.keywords.join(', ')}\n\n`;
-      }
+      if (a.reason) report += `💡 ${a.reason}\n\n`;
+      if (a.keywords.length > 0) report += `🏷️ ${a.keywords.join(', ')}\n\n`;
     }
-    report += `---\n\n`;
+    report += `─────────────\n\n`;
   }
 
-  // ── Visual Statistics ──
-  report += `## 📊 数据概览\n\n`;
+  report += `📊 数据概览\n\n`;
+  report += `扫描源: ${stats.successFeeds}/${stats.totalFeeds} | 文章: ${stats.totalArticles} → ${stats.filteredArticles} | 精选: ${articles.length}\n\n`;
 
-  report += `| 扫描源 | 抓取文章 | 时间范围 | 精选 |\n`;
-  report += `|:---:|:---:|:---:|:---:|\n`;
-  report += `| ${stats.successFeeds}/${stats.totalFeeds} | ${stats.totalArticles} 篇 → ${stats.filteredArticles} 篇 | ${stats.hours}h | **${articles.length} 篇** |\n\n`;
-
-  const pieChart = generateCategoryPieChart(articles);
-  if (pieChart) {
-    report += `### 分类分布\n\n${pieChart}\n`;
+  const kwCount = new Map<string, number>();
+  for (const a of articles) {
+    for (const kw of a.keywords) {
+      const normalized = kw.toLowerCase();
+      kwCount.set(normalized, (kwCount.get(normalized) || 0) + 1);
+    }
+  }
+  const sortedKw = Array.from(kwCount.entries()).sort((a, b) => b[1] - a[1]).slice(0, 10);
+  if (sortedKw.length > 0) {
+    report += `🏷️ 高频话题: ${sortedKw.map(([k, v]) => `${k}(${v})`).join(' · ')}\n\n`;
   }
 
-  const barChart = generateKeywordBarChart(articles);
-  if (barChart) {
-    report += `### 高频关键词\n\n${barChart}\n`;
-  }
+  report += `─────────────\n\n`;
 
-  const asciiChart = generateAsciiBarChart(articles);
-  if (asciiChart) {
-    report += `<details>\n<summary>📈 纯文本关键词图（终端友好）</summary>\n\n${asciiChart}\n</details>\n\n`;
-  }
-
-  const tagCloud = generateTagCloud(articles);
-  if (tagCloud) {
-    report += `### 🏷️ 话题标签\n\n${tagCloud}\n\n`;
-  }
-
-  report += `---\n\n`;
-
-  // ── Category-Grouped Articles ──
   const categoryGroups = new Map<CategoryId, ScoredArticle[]>();
   for (const a of articles) {
     const list = categoryGroups.get(a.category) || [];
@@ -860,32 +686,27 @@ function generateDigestReport(articles: ScoredArticle[], highlights: string, sta
     categoryGroups.set(a.category, list);
   }
 
-  const sortedCategories = Array.from(categoryGroups.entries())
-    .sort((a, b) => b[1].length - a[1].length);
+  const sortedCategories = Array.from(categoryGroups.entries()).sort((a, b) => b[1].length - a[1].length);
 
   let globalIndex = 0;
   for (const [catId, catArticles] of sortedCategories) {
     const catMeta = CATEGORY_META[catId];
-    report += `## ${catMeta.emoji} ${catMeta.label}\n\n`;
+    report += `${catMeta.emoji} ${catMeta.label}\n\n`;
 
     for (const a of catArticles) {
       globalIndex++;
       const scoreTotal = a.scoreBreakdown.relevance + a.scoreBreakdown.quality + a.scoreBreakdown.timeliness;
 
-      report += `### ${globalIndex}. ${a.titleZh || a.title}\n\n`;
-      report += `[${a.title}](${a.link}) — **${a.sourceName}** · ${humanizeTime(a.pubDate)} · ⭐ ${scoreTotal}/30\n\n`;
+      report += `${globalIndex}. ${a.titleZh || a.title}\n`;
+      report += `${a.link}\n`;
+      report += `${a.sourceName} · ${humanizeTime(a.pubDate)} · ⭐${scoreTotal}/30\n\n`;
       report += `> ${a.summary}\n\n`;
-      if (a.keywords.length > 0) {
-        report += `🏷️ ${a.keywords.join(', ')}\n\n`;
-      }
-      report += `---\n\n`;
+      if (a.keywords.length > 0) report += `🏷️ ${a.keywords.join(', ')}\n\n`;
     }
   }
 
-  // ── Footer ──
-  report += `*生成于 ${dateStr} ${now.toISOString().split('T')[1]?.slice(0, 5) || ''} | 扫描 ${stats.successFeeds} 源 → 获取 ${stats.totalArticles} 篇 → 精选 ${articles.length} 篇*\n`;
-  report += `*基于 [Hacker News Popularity Contest 2025](https://refactoringenglish.com/tools/hn-popularity/) RSS 源列表，由 [Andrej Karpathy](https://x.com/karpathy) 推荐*\n`;
-  report += `*由「懂点儿AI」制作，欢迎关注同名微信公众号获取更多 AI 实用技巧 💡*\n`;
+  report += `─────────────\n`;
+  report += `生成于 ${dateStr} | 扫描 ${stats.successFeeds} 源 → 获取 ${stats.totalArticles} 篇 → 精选 ${articles.length} 篇\n`;
 
   return report;
 }
@@ -898,7 +719,8 @@ function printUsage(): never {
   console.log(`AI Daily Digest - AI-powered RSS digest from 90 top tech blogs
 
 Usage:
-  bun scripts/digest.ts [options]
+  node scripts/digest.js [options] (after compiling with tsc)
+  or run directly with ts-node
 
 Options:
   --hours <n>     Time range in hours (default: 48)
@@ -908,11 +730,12 @@ Options:
   --help          Show this help
 
 Environment:
-  GEMINI_API_KEY  Required. Get one at https://aistudio.google.com/apikey
+  LLM_API_KEY    Required. API key for the LLM service
+  LLM_API_URL    Optional. API endpoint (default: https://api.moonshot.cn/v1/chat/completions)
+  LLM_MODEL      Optional. Model name (default: moonshot-v1-8k)
 
 Examples:
-  bun scripts/digest.ts --hours 24 --top-n 10 --lang zh
-  bun scripts/digest.ts --hours 72 --top-n 20 --lang en --output ./my-digest.md
+  LLM_API_KEY=xxx node scripts/digest.js --hours 24 --top-n 10 --lang zh
 `);
   process.exit(0);
 }
@@ -939,10 +762,9 @@ async function main(): Promise<void> {
     }
   }
   
-  const apiKey = process.env.GEMINI_API_KEY;
+  const apiKey = process.env.LLM_API_KEY;
   if (!apiKey) {
-    console.error('[digest] Error: GEMINI_API_KEY environment variable is required.');
-    console.error('[digest] Get one at: https://aistudio.google.com/apikey');
+    console.error('[digest] Error: LLM_API_KEY environment variable is required.');
     process.exit(1);
   }
   
@@ -952,6 +774,8 @@ async function main(): Promise<void> {
   }
   
   console.log(`[digest] === AI Daily Digest ===`);
+  console.log(`[digest] API: ${LLM_API_URL}`);
+  console.log(`[digest] Model: ${LLM_MODEL}`);
   console.log(`[digest] Time range: ${hours} hours`);
   console.log(`[digest] Top N: ${topN}`);
   console.log(`[digest] Language: ${lang}`);
@@ -974,7 +798,6 @@ async function main(): Promise<void> {
   
   if (recentArticles.length === 0) {
     console.error(`[digest] Error: No articles found within the last ${hours} hours.`);
-    console.error(`[digest] Try increasing --hours (e.g., --hours 168 for one week)`);
     process.exit(1);
   }
   
