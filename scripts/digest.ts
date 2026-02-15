@@ -1,6 +1,7 @@
-import { writeFile, mkdir } from 'node:fs/promises';
+import { writeFile, mkdir, readFileSync, existsSync } from 'node:fs/promises';
 import { dirname } from 'node:path';
 import process from 'node:process';
+import { existsSync as existsSyncSync, readFileSync as readFileSyncSync } from 'node:fs';
 
 // ============================================================================
 // Constants
@@ -24,10 +25,9 @@ function loadConfig(): { apiUrl: string; apiKey: string; model: string } {
   // Try config file
   try {
     const configPath = CONFIG_FILE;
-    const fs = require('fs');
     console.log(`[digest] Looking for config at: ${configPath}`);
-    if (fs.existsSync(configPath)) {
-      const config = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
+    if (existsSyncSync(configPath)) {
+      const config = JSON.parse(readFileSyncSync(configPath, 'utf-8'));
       console.log(`[digest] Loaded config from file (apiKey: ${config.llmApiKey ? config.llmApiKey.slice(0, 10) + '...' : 'missing'})`);
       return {
         apiUrl: config.llmApiUrl || 'https://api.moonshot.cn/v1/chat/completions',
