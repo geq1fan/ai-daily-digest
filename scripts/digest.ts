@@ -7,8 +7,46 @@ import process from 'node:process';
 // ============================================================================
 
 // OpenAI-compatible API configuration
-const LLM_API_URL = process.env.LLM_API_URL || 'https://api.moonshot.cn/v1/chat/completions';
-const LLM_MODEL = process.env.LLM_MODEL || 'moonshot-v1-8k';
+// Priority: env vars > config file > defaults
+const CONFIG_FILE = process.env.HOME + '/.ai-daily-digest/config.json';
+
+function loadConfig(): { apiUrl: string; apiKey: string; model: string } {
+  // Try env vars first
+  if (process.env.LLM_API_KEY) {
+    return {
+      apiUrl: process.env.LLM_API_URL || 'https://api.moonshot.cn/v1/chat/completions',
+      apiKey: process.env.LLM_API_KEY,
+      model: process.env.LLM_MODEL || 'moonshot-v1-8k',
+    };
+  }
+  
+  // Try config file
+  try {
+    const configPath = CONFIG_FILE;
+    const fs = require('fs');
+    if (fs.existsSync(configPath)) {
+      const config = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
+      return {
+        apiUrl: config.llmApiUrl || 'https://api.moonshot.cn/v1/chat/completions',
+        apiKey: config.llmApiKey,
+        model: config.llmModel || 'moonshot-v1-8k',
+      };
+    }
+  } catch (e) {
+    // Ignore config file errors
+  }
+  
+  // Defaults (will fail without API key)
+  return {
+    apiUrl: 'https://api.moonshot.cn/v1/chat/completions',
+    apiKey: '',
+    model: 'moonshot-v1-8k',
+  };
+}
+
+const CONFIG = loadConfig();
+const LLM_API_URL = CONFIG.apiUrl;
+const LLM_MODEL = CONFIG.model;
 
 const FEED_FETCH_TIMEOUT_MS = 15_000;
 const FEED_CONCURRENCY = 10;
@@ -787,9 +825,11 @@ async function main(): Promise<void> {
     }
   }
   
-  const apiKey = process.env.LLM_API_KEY;
+  const apiKey = CONFIG.apiKey;
   if (!apiKey) {
-    console.error('[digest] Error: LLM_API_KEY environment variable is required.');
+    console.error('[digest] Error: API key required.');
+    console.error('[digest] Set LLM_API_KEY env var, or create config at ~/.ai-daily-digest/config.json');
+    console.error('[digest] Config format: { "llmApiKey": "xxx", "llmApiUrl": "...", "llmModel": "..." }');
     process.exit(1);
   }
   
