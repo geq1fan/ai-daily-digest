@@ -8,11 +8,12 @@ import process from 'node:process';
 
 // OpenAI-compatible API configuration
 // Priority: env vars > config file > defaults
-const CONFIG_FILE = process.env.HOME + '/.ai-daily-digest/config.json';
+const CONFIG_FILE = (process.env.HOME || '/root') + '/.ai-daily-digest/config.json';
 
 function loadConfig(): { apiUrl: string; apiKey: string; model: string } {
   // Try env vars first
   if (process.env.LLM_API_KEY) {
+    console.log('[digest] Using config from environment variables');
     return {
       apiUrl: process.env.LLM_API_URL || 'https://api.moonshot.cn/v1/chat/completions',
       apiKey: process.env.LLM_API_KEY,
@@ -24,19 +25,24 @@ function loadConfig(): { apiUrl: string; apiKey: string; model: string } {
   try {
     const configPath = CONFIG_FILE;
     const fs = require('fs');
+    console.log(`[digest] Looking for config at: ${configPath}`);
     if (fs.existsSync(configPath)) {
       const config = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
+      console.log(`[digest] Loaded config from file (apiKey: ${config.llmApiKey ? config.llmApiKey.slice(0, 10) + '...' : 'missing'})`);
       return {
         apiUrl: config.llmApiUrl || 'https://api.moonshot.cn/v1/chat/completions',
         apiKey: config.llmApiKey,
         model: config.llmModel || 'moonshot-v1-8k',
       };
+    } else {
+      console.log(`[digest] Config file not found at ${configPath}`);
     }
-  } catch (e) {
-    // Ignore config file errors
+  } catch (e: any) {
+    console.log(`[digest] Config file error: ${e.message}`);
   }
   
   // Defaults (will fail without API key)
+  console.log('[digest] No config found, using defaults (no API key)');
   return {
     apiUrl: 'https://api.moonshot.cn/v1/chat/completions',
     apiKey: '',
